@@ -1,0 +1,260 @@
+// ============================================================================
+// WATER QUALITY MONITORING - ESP32 + DS18B20 + DFRobot DO (SEN0237)
+// - Reads temperature from DS18B20 (GPIO4)
+// - Reads DO from analog board (GPIO34)
+// - Uses official DFRobot DO algorithm (with 2-point calibration support)
+// - Sends data to Supabase via REST API
+// ============================================================================
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ============================================================================
+// USER CONFIG - UPDATE THESE 4 VALUES
+// ============================================================================
+
+// 1) WiFi
+const char* WIFI_SSID     = "Bawa OnePlus Nord CE 3 Lite 5G";
+const char* WIFI_PASSWORD = "Bawa12345";
+
+// 2) Supabase
+const char* SUPABASE_URL  = "https://ydostqcvgxunfeifnblv.supabase.co";  // NO trailing slash
+const char* SUPABASE_KEY  = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inlkb3N0cWN2Z3h1bmZlaWZuYmx2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjY0NjY3ODgsImV4cCI6MjA4MjA0Mjc4OH0.tl7nx1rV9R9BvYxNALWPa8o3c5_KSOZwDYC5UA4Fw8c";
+
+// ============================================================================
+// PIN CONFIG
+// ============================================================================
+
+// DO sensor analog output connected to ESP32 GPIO34 (ADC input)
+#define DO_PIN        34     // You can change to 32/33/35 etc, but must be ADC1 pin
+
+// DS18B20 data pin
+#define TEMP_PIN      4      // You said pin 4 is OK
+
+// ============================================================================
+// DO SENSOR CONSTANTS (from DFRobot example)
+// ============================================================================
+
+#define VREF          5000   // mV reference in original example
+#define ADC_RES       1024   // Original example uses 10‑bit ADC
+
+// Single‑point calibration Mode=0
+// Two‑point calibration Mode=1
+#define TWO_POINT_CALIBRATION 1      // you want 2‑point
+
+// If no temp sensor, READ_TEMP would be constant,
+// but here we read real temperature.
+#define READ_TEMP     (25)   // not used directly now, we read DS18B20
+
+// Single‑point calibration (used when TWO_POINT_CALIBRATION == 0)
+#define CAL1_V (1600) // mv
+#define CAL1_T (25)   // ℃
+
+// Two‑point calibration (used when TWO_POINT_CALIBRATION == 1)
+// CAL1: high temp point, CAL2: low temp point
+#define CAL2_V (1300) // mv
+#define CAL2_T (15)   // ℃
+
+// Official DFRobot DO table (µg/L) for 0–40 °C
+const uint16_t DO_Table[41] = {
+  14460, 14220, 13820, 13440, 13090, 12740, 12420, 12110, 11810, 11530,
+  11260, 11010, 10770, 10530, 10300, 10080, 9860, 9660, 9460, 9270,
+  9080, 8900, 8730, 8570, 8410, 8250, 8110, 7960, 7820, 7690,
+  7560, 7430, 7300, 7180, 7070, 6950, 6840, 6730, 6630, 6530, 6410
+};
+
+// ============================================================================
+// TEMPERATURE SENSOR (DS18B20) SETUP
+// ============================================================================
+
+OneWire oneWire(TEMP_PIN);
+DallasTemperature tempSensor(&oneWire);
+
+// ============================================================================
+// GLOBALS
+// ============================================================================
+
+float waterTempC      = 25.0;
+uint16_t adcRaw       = 0;
+uint16_t adcVoltage   = 0;
+float do_mgL          = 0.0;
+unsigned long readingCount = 0;
+
+// Forward declaration
+int16_t readDO(uint32_t voltage_mv, uint8_t temperature_c);
+void sendToSupabase(float tempC, float doMgL);
+
+// ============================================================================
+// SETUP
+// ============================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println();
+  Serial.println("===========================================");
+  Serial.println("  ESP32 Water Quality Monitor (DO + Temp)");
+  Serial.println("===========================================");
+
+  // Init temperature sensor
+  tempSensor.begin();
+  Serial.println("DS18B20 temperature sensor initialized.");
+
+  // Configure DO pin as input
+  pinMode(DO_PIN, INPUT);
+
+  // WiFi setup
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 20) {
+    delay(500);
+    Serial.print(".");
+    tries++;
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi connected ✅");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("WiFi connection FAILED ❌ (will still try to read sensors)");
+  }
+}
+
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
+void loop() {
+  // 1) Read temperature from DS18B20
+  tempSensor.requestTemperatures();
+  float t = tempSensor.getTempCByIndex(0);
+  if (t == DEVICE_DISCONNECTED_C || t < -50 || t > 100) {
+    Serial.println("Temperature sensor error, using 25.0°C fallback.");
+    waterTempC = 25.0;
+  } else {
+    waterTempC = t;
+  }
+
+  // 2) Read DO analog
+  adcRaw = analogRead(DO_PIN);
+
+  // ESP32 ADC is 12‑bit (0–4095), DFRobot formula uses 0–1023.
+  // To remain proportional, we map 0–4095 → 0–1023:
+  uint16_t adcRaw10 = map(adcRaw, 0, 4095, 0, 1023);
+  adcVoltage = (uint32_t)VREF * adcRaw10 / ADC_RES;
+
+  // 3) Compute DO in µg/L using DFRobot formula
+  uint8_t tempIndex = (uint8_t)round(waterTempC);
+  if (tempIndex > 40) tempIndex = 40;
+  if (tempIndex < 0)  tempIndex = 0;
+
+  int16_t DO_raw = readDO(adcVoltage, tempIndex);
+  do_mgL = DO_raw / 1000.0; // convert µg/L → mg/L
+
+  // 4) Print debug
+  Serial.println("------------- NEW READING -------------");
+  Serial.print("Water Temp: ");
+  Serial.print(waterTempC, 2);
+  Serial.println(" °C");
+
+  Serial.print("ADC Raw (12-bit): ");
+  Serial.println(adcRaw);
+
+  Serial.print("ADC Raw (10-bit eqv): ");
+  Serial.println(adcRaw10);
+
+  Serial.print("ADC Voltage: ");
+  Serial.print(adcVoltage);
+  Serial.println(" mV");
+
+  Serial.print("DO: ");
+  Serial.print(do_mgL, 3);
+  Serial.println(" mg/L");
+
+  // 5) Send to Supabase (if WiFi is OK)
+  sendToSupabase(waterTempC, do_mgL);
+
+  readingCount++;
+  Serial.print("Total readings sent: ");
+  Serial.println(readingCount);
+
+  Serial.println("----------------------------------------\n");
+
+  delay(10000); // 10 seconds between readings
+}
+
+// ============================================================================
+// DO COMPUTATION (from DFRobot wiki sample)
+// ============================================================================
+int16_t readDO(uint32_t voltage_mv, uint8_t temperature_c) {
+#if TWO_POINT_CALIBRATION == 0
+  // Single‑point calibration
+  uint16_t V_saturation = (uint32_t)CAL1_V
+                        + (uint32_t)35 * temperature_c
+                        - (uint32_t)CAL1_T * 35;
+  return (voltage_mv * DO_Table[temperature_c] / V_saturation);
+#else
+  // Two‑point calibration
+  uint16_t V_saturation = (int16_t)((int8_t)temperature_c - CAL2_T)
+                        * ((uint16_t)CAL1_V - CAL2_V)
+                        / ((uint8_t)CAL1_T - CAL2_T)
+                        + CAL2_V;
+  return (voltage_mv * DO_Table[temperature_c] / V_saturation);
+#endif
+}
+
+// ============================================================================
+// SEND DATA TO SUPABASE
+// ============================================================================
+void sendToSupabase(float tempC, float doMgL) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected, skipping Supabase POST.");
+    return;
+  }
+
+  HTTPClient http;
+  String url = String(SUPABASE_URL) + "/rest/v1/sensor_readings";
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
+  http.addHeader("apikey", SUPABASE_KEY);
+  http.addHeader("Prefer", "return=minimal");
+
+  // JSON body matches your website expectations
+  String body = "{";
+  body += "\"temperature\":" + String(tempC, 2) + ",";
+  body += "\"dissolved_oxygen\":" + String(doMgL, 3);
+  body += "}";
+
+  Serial.print("POST ");
+  Serial.println(url);
+  Serial.print("Payload: ");
+  Serial.println(body);
+
+  int httpCode = http.POST(body);
+
+  if (httpCode > 0) {
+    Serial.print("HTTP status: ");
+    Serial.println(httpCode);
+    if (httpCode == 200 || httpCode == 201 || httpCode == 204) {
+      Serial.println("Supabase insert OK ✅");
+    } else {
+      Serial.println("Supabase responded with error code:");
+      Serial.println(http.getString());
+    }
+  } else {
+    Serial.print("HTTP POST failed: ");
+    Serial.println(http.errorToString(httpCode));
+  }
+
+  http.end();
+}
